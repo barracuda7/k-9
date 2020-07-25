@@ -9,6 +9,8 @@ import com.fsck.k9.mail.FetchProfile
 import com.fsck.k9.mail.Flag
 import com.fsck.k9.mail.Message
 import com.fsck.k9.mail.Part
+import com.fsck.k9.mail.PushReceiver
+import com.fsck.k9.mail.Pusher
 import com.fsck.k9.mail.store.pop3.Pop3Store
 import com.fsck.k9.mail.transport.smtp.SmtpTransport
 
@@ -123,7 +125,11 @@ class Pop3Backend(
     override fun uploadMessage(folderServerId: String, message: Message): String? {
         throw UnsupportedOperationException("not supported")
     }
-
+    
+    override fun createPusher(receiver: PushReceiver): Pusher {
+        throw UnsupportedOperationException("not supported")
+    }
+    
     override fun checkIncomingServerSettings() {
         pop3Store.checkSettings()
     }

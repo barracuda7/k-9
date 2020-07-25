@@ -335,6 +335,15 @@ class ImapSync {
 
             fetchUnsyncedMessages(syncConfig, remoteFolder, unsyncedMessages, smallMessages, largeMessages, progress,
                     todo, fp, listener);
+                    
+            String updatedPushState = backendFolder.getPushState();
+            for (Message message : unsyncedMessages) {
+                String newPushState = remoteFolder.getNewPushState(updatedPushState, message);
+                if (newPushState != null) {
+                    updatedPushState = newPushState;
+                }
+            }
+            backendFolder.setPushState(updatedPushState);
 
             Timber.d("SYNC: Synced unsynced messages for folder %s", folder);
         }
@@ -408,6 +417,10 @@ class ImapSync {
 
                 unsyncedMessages.add(message);
             } else {
+                String newPushState = remoteFolder.getNewPushState(backendFolder.getPushState(), message);
+                if (newPushState != null) {
+                    backendFolder.setPushState(newPushState);
+                }
                 syncFlagMessages.add(message);
             }
         } else {

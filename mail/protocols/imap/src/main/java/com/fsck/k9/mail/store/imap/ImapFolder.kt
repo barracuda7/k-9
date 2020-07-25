@@ -1,221 +1,256 @@
-package com.fsck.k9.mail.store.imap
+package com.fsck.k9.mail.store.imap;
 
-import com.fsck.k9.mail.Body
-import com.fsck.k9.mail.BodyFactory
-import com.fsck.k9.mail.FetchProfile
-import com.fsck.k9.mail.Flag
-import com.fsck.k9.mail.FolderType
-import com.fsck.k9.mail.K9MailLib
-import com.fsck.k9.mail.Message
-import com.fsck.k9.mail.MessageRetrievalListener
-import com.fsck.k9.mail.MessagingException
-import com.fsck.k9.mail.Part
-import com.fsck.k9.mail.filter.EOLConvertingOutputStream
-import com.fsck.k9.mail.internet.MimeBodyPart
-import com.fsck.k9.mail.internet.MimeHeader
-import com.fsck.k9.mail.internet.MimeMessageHelper
-import com.fsck.k9.mail.internet.MimeMultipart
-import com.fsck.k9.mail.internet.MimeUtility
-import java.io.ByteArrayInputStream
-import java.io.IOException
-import java.io.InputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.HashMap
-import java.util.LinkedHashSet
-import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.max
-import kotlin.math.min
-import timber.log.Timber
 
-class ImapFolder internal constructor(
-    private var store: ImapStore,
-    val serverId: String,
-    private val folderNameCodec: FolderNameCodec
-) {
-    @Volatile
-    private var uidNext = -1L
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-    @Volatile
-    private var connection: ImapConnection? = null
-    private var msgSeqUidMap: MutableMap<Long, String> = ConcurrentHashMap()
-    @Volatile
-    private var exists = false
-    private var inSearch = false
-    private var canCreateKeywords = false
-    private var uidValidity: Long? = null
+import android.text.TextUtils;
 
-    @Volatile
-    var messageCount = -1
-        private set
+import com.fsck.k9.mail.Body;
+import com.fsck.k9.mail.BodyFactory;
+import com.fsck.k9.mail.FetchProfile;
+import com.fsck.k9.mail.Flag;
+import com.fsck.k9.mail.Folder;
+import com.fsck.k9.mail.K9MailLib;
+import com.fsck.k9.mail.Message;
+import com.fsck.k9.mail.MessageRetrievalListener;
+import com.fsck.k9.mail.MessagingException;
+import com.fsck.k9.mail.Part;
+import com.fsck.k9.mail.filter.EOLConvertingOutputStream;
+import com.fsck.k9.mail.internet.MimeBodyPart;
+import com.fsck.k9.mail.internet.MimeHeader;
+import com.fsck.k9.mail.internet.MimeMessageHelper;
+import com.fsck.k9.mail.internet.MimeMultipart;
+import com.fsck.k9.mail.internet.MimeUtility;
+import timber.log.Timber;
 
-    var type = FolderType.REGULAR
+import static com.fsck.k9.mail.store.imap.ImapUtility.getLastResponse;
 
-    var mode = 0
-        private set
 
-    val isOpen: Boolean
-        get() = connection != null
+public class ImapFolder extends Folder<ImapMessage> {
+    static final String INBOX = "INBOX";
+    private static final ThreadLocal<SimpleDateFormat> RFC3501_DATE = new ThreadLocal<SimpleDateFormat>() {
+        @Override
+        protected SimpleDateFormat initialValue() {
+            return new SimpleDateFormat("dd-MMM-yyyy", Locale.US);
+        }
+    };
+    private static final int MORE_MESSAGES_WINDOW_SIZE = 500;
+    private static final int FETCH_WINDOW_SIZE = 100;
 
-    constructor(store: ImapStore, name: String) : this(store, name, store.folderNameCodec)
 
-    fun getUidValidity(): Long? {
-        check(isOpen) { "ImapFolder needs to be open" }
-        return uidValidity
+    protected volatile int messageCount = -1;
+    protected volatile long uidNext = -1L;
+    protected volatile ImapConnection connection;
+    protected ImapStore store = null;
+    protected Map<Long, String> msgSeqUidMap = new ConcurrentHashMap<>();
+    private final FolderNameCodec folderNameCodec;
+    private final String name;
+    private int mode;
+    private volatile boolean exists;
+    private boolean inSearch = false;
+    private boolean canCreateKeywords = false;
+
+
+    public ImapFolder(ImapStore store, String name) {
+        this(store, name, store.getFolderNameCodec());
     }
 
-    @get:Throws(MessagingException::class)
-    private val prefixedName: String
-        get() {
-            var prefixedName = ""
-            if (!INBOX.equals(serverId, ignoreCase = true)) {
-                val connection = synchronized(this) {
-                    this.connection ?: store.connection
-                }
+    ImapFolder(ImapStore store, String name, FolderNameCodec folderNameCodec) {
+        super();
+        this.store = store;
+        this.name = name;
+        this.folderNameCodec = folderNameCodec;
+    }
 
-                try {
-                    connection.open()
-                } catch (ioe: IOException) {
-                    throw MessagingException("Unable to get IMAP prefix", ioe)
-                } finally {
-                    if (this.connection == null) {
-                        store.releaseConnection(connection)
-                    }
+    private String getPrefixedName() throws MessagingException {
+        String prefixedName = "";
+
+        if (!INBOX.equalsIgnoreCase(name)) {
+            ImapConnection connection;
+            synchronized (this) {
+                if (this.connection == null) {
+                    connection = store.getConnection();
+                } else {
+                    connection = this.connection;
                 }
-                prefixedName = store.combinedPrefix
             }
-            prefixedName += serverId
 
-            return prefixedName
+            try {
+                connection.open();
+            } catch (IOException ioe) {
+                throw new MessagingException("Unable to get IMAP prefix", ioe);
+            } finally {
+                if (this.connection == null) {
+                    store.releaseConnection(connection);
+                }
+            }
+
+            prefixedName = store.getCombinedPrefix();
         }
 
-    @Throws(MessagingException::class, IOException::class)
-    private fun executeSimpleCommand(command: String): List<ImapResponse> {
-        return handleUntaggedResponses(connection!!.executeSimpleCommand(command))
+        prefixedName += name;
+
+        return prefixedName;
     }
 
-    @Throws(MessagingException::class)
-    fun open(mode: Int) {
-        internalOpen(mode)
+    private List<ImapResponse> executeSimpleCommand(String command) throws MessagingException, IOException {
+        return handleUntaggedResponses(connection.executeSimpleCommand(command));
+    }
+
+    @Override
+    public void open(int mode) throws MessagingException {
+        internalOpen(mode);
 
         if (messageCount == -1) {
-            throw MessagingException("Did not find message count during open")
+            throw new MessagingException("Did not find message count during open");
         }
     }
 
-    @Throws(MessagingException::class)
-    private fun internalOpen(mode: Int): List<ImapResponse> {
-        if (isOpen && this.mode == mode) {
-            // Make sure the connection is valid. If it's not we'll close it down and continue on to get a new one.
+    protected List<ImapResponse> internalOpen(int mode) throws MessagingException {
+        if (isOpen() && this.mode == mode) {
+            // Make sure the connection is valid. If it's not we'll close it down and continue
+            // on to get a new one.
             try {
-                return executeSimpleCommand(Commands.NOOP)
-            } catch (ioe: IOException) {
-                /* don't throw */ ioExceptionHandler(connection, ioe)
+                return executeSimpleCommand(Commands.NOOP);
+            } catch (IOException ioe) {
+                /* don't throw */ ioExceptionHandler(connection, ioe);
             }
         }
 
-        store.releaseConnection(connection)
+        store.releaseConnection(connection);
 
-        synchronized(this) {
-            connection = store.connection
+        synchronized (this) {
+            connection = store.getConnection();
         }
 
         try {
-            msgSeqUidMap.clear()
+            msgSeqUidMap.clear();
 
-            val openCommand = if (mode == OPEN_MODE_RW) "SELECT" else "EXAMINE"
-            val encodedFolderName = folderNameCodec.encode(prefixedName)
-            val escapedFolderName = ImapUtility.encodeString(encodedFolderName)
-            val command = String.format("%s %s", openCommand, escapedFolderName)
-            val responses = executeSimpleCommand(command)
+            String openCommand = mode == OPEN_MODE_RW ? "SELECT" : "EXAMINE";
+            String encodedFolderName = folderNameCodec.encode(getPrefixedName());
+            String escapedFolderName = ImapUtility.encodeString(encodedFolderName);
+            String command = String.format("%s %s", openCommand, escapedFolderName);
+            List<ImapResponse> responses = executeSimpleCommand(command);
 
             /*
              * If the command succeeds we expect the folder has been opened read-write unless we
              * are notified otherwise in the responses.
              */
-            this.mode = mode
+            this.mode = mode;
 
-            for (response in responses) {
-                extractUidValidity(response)
-                handlePermanentFlags(response)
+            for (ImapResponse response : responses) {
+                handlePermanentFlags(response);
             }
 
-            handleSelectOrExamineOkResponse(ImapUtility.getLastResponse(responses))
+            handleSelectOrExamineOkResponse(getLastResponse(responses));
 
-            exists = true
+            exists = true;
 
-            return responses
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
-        } catch (me: MessagingException) {
-            Timber.e(me, "Unable to open connection for %s", logId)
-            throw me
+            return responses;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
+        } catch (MessagingException me) {
+            Timber.e(me, "Unable to open connection for %s", getLogId());
+            throw me;
         }
     }
 
-    private fun extractUidValidity(response: ImapResponse) {
-        val uidValidityResponse = UidValidityResponse.parse(response)
-        if (uidValidityResponse != null) {
-            uidValidity = uidValidityResponse.uidValidity
+    private void handlePermanentFlags(ImapResponse response) {
+        PermanentFlagsResponse permanentFlagsResponse = PermanentFlagsResponse.parse(response);
+        if (permanentFlagsResponse == null) {
+            return;
         }
+
+        Set<Flag> permanentFlags = store.getPermanentFlagsIndex();
+        permanentFlags.addAll(permanentFlagsResponse.getFlags());
+        canCreateKeywords = permanentFlagsResponse.canCreateKeywords();
     }
 
-    private fun handlePermanentFlags(response: ImapResponse) {
-        val permanentFlagsResponse = PermanentFlagsResponse.parse(response) ?: return
+    private void handleSelectOrExamineOkResponse(ImapResponse response) {
+        SelectOrExamineResponse selectOrExamineResponse = SelectOrExamineResponse.parse(response);
+        if (selectOrExamineResponse == null) {
+            // This shouldn't happen
+            return;
+        }
 
-        val permanentFlags = store.permanentFlagsIndex
-        permanentFlags.addAll(permanentFlagsResponse.flags)
-        canCreateKeywords = permanentFlagsResponse.canCreateKeywords()
-    }
-
-    private fun handleSelectOrExamineOkResponse(response: ImapResponse) {
-        val selectOrExamineResponse = SelectOrExamineResponse.parse(response) ?: return // This shouldn't happen
         if (selectOrExamineResponse.hasOpenMode()) {
-            mode = selectOrExamineResponse.openMode
+            mode = selectOrExamineResponse.getOpenMode();
         }
     }
 
-    fun close() {
-        messageCount = -1
+    @Override
+    public boolean isOpen() {
+        return connection != null;
+    }
 
-        if (!isOpen) {
-            return
+    @Override
+    public int getMode() {
+        return mode;
+    }
+
+    @Override
+    public void close() {
+        messageCount = -1;
+
+        if (!isOpen()) {
+            return;
         }
 
-        synchronized(this) {
+        synchronized (this) {
             // If we are mid-search and we get a close request, we gotta trash the connection.
             if (inSearch && connection != null) {
-                Timber.i("IMAP search was aborted, shutting down connection.")
-                connection!!.close()
+                Timber.i("IMAP search was aborted, shutting down connection.");
+                connection.close();
             } else {
-                store.releaseConnection(connection)
+                store.releaseConnection(connection);
             }
 
-            connection = null
+            connection = null;
         }
     }
 
-    @Throws(MessagingException::class)
-    private fun exists(escapedFolderName: String): Boolean {
-        return try {
+    @Override
+    public String getServerId() {
+        return name;
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    private boolean exists(String escapedFolderName) throws MessagingException {
+        try {
             // Since we don't care about RECENT, we'll use that for the check, because we're checking
             // a folder other than ourself, and don't want any untagged responses to cause a change
             // in our own fields
-            connection!!.executeSimpleCommand(String.format("STATUS %s (RECENT)", escapedFolderName))
-
-            true
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
-        } catch (e: NegativeImapResponseException) {
-            false
+            connection.executeSimpleCommand(String.format("STATUS %s (RECENT)", escapedFolderName));
+            return true;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
+        } catch (NegativeImapResponseException e) {
+            return false;
         }
     }
 
-    @Throws(MessagingException::class)
-    fun exists(): Boolean {
+    @Override
+    public boolean exists() throws MessagingException {
         if (exists) {
-            return true
+            return true;
         }
 
         /*
@@ -223,53 +258,63 @@ class ImapFolder internal constructor(
          * so we must get the connection ourselves if it's not there. We are specifically
          * not calling checkOpen() since we don't care if the folder is open.
          */
-        val connection = synchronized(this) {
-            this.connection ?: store.connection
+        ImapConnection connection;
+        synchronized (this) {
+            if (this.connection == null) {
+                connection = store.getConnection();
+            } else {
+                connection = this.connection;
+            }
         }
 
-        return try {
-            val encodedFolderName = folderNameCodec.encode(prefixedName)
-            val escapedFolderName = ImapUtility.encodeString(encodedFolderName)
-            connection.executeSimpleCommand(String.format("STATUS %s (UIDVALIDITY)", escapedFolderName))
+        try {
+            String encodedFolderName = folderNameCodec.encode(getPrefixedName());
+            String escapedFolderName = ImapUtility.encodeString(encodedFolderName);
+            connection.executeSimpleCommand(String.format("STATUS %s (UIDVALIDITY)", escapedFolderName));
 
-            exists = true
+            exists = true;
 
-            true
-        } catch (e: NegativeImapResponseException) {
-            false
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            return true;
+        } catch (NegativeImapResponseException e) {
+            return false;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         } finally {
             if (this.connection == null) {
-                store.releaseConnection(connection)
+                store.releaseConnection(connection);
             }
         }
     }
 
-    @Throws(MessagingException::class)
-    fun create(): Boolean {
+    @Override
+    public boolean create() throws MessagingException {
         /*
          * This method needs to operate in the unselected mode as well as the selected mode
          * so we must get the connection ourselves if it's not there. We are specifically
          * not calling checkOpen() since we don't care if the folder is open.
          */
-        val connection = synchronized(this) {
-            this.connection ?: store.connection
+        ImapConnection connection;
+        synchronized (this) {
+            if (this.connection == null) {
+                connection = store.getConnection();
+            } else {
+                connection = this.connection;
+            }
         }
 
-        return try {
-            val encodedFolderName = folderNameCodec.encode(prefixedName)
-            val escapedFolderName = ImapUtility.encodeString(encodedFolderName)
-            connection.executeSimpleCommand(String.format("CREATE %s", escapedFolderName))
+        try {
+            String encodedFolderName = folderNameCodec.encode(getPrefixedName());
+            String escapedFolderName = ImapUtility.encodeString(encodedFolderName);
+            connection.executeSimpleCommand(String.format("CREATE %s", escapedFolderName));
 
-            true
-        } catch (e: NegativeImapResponseException) {
-            false
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(this.connection, ioe)
+            return true;
+        } catch (NegativeImapResponseException e) {
+            return false;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(this.connection, ioe);
         } finally {
             if (this.connection == null) {
-                store.releaseConnection(connection)
+                store.releaseConnection(connection);
             }
         }
     }
@@ -277,541 +322,587 @@ class ImapFolder internal constructor(
     /**
      * Copies the given messages to the specified folder.
      *
-     * **Note:**
-     * Only the UIDs of the given [ImapMessage] instances are used. It is assumed that all
+     * <p>
+     * <strong>Note:</strong>
+     * Only the UIDs of the given {@link Message} instances are used. It is assumed that all
      * UIDs represent valid messages in this folder.
+     * </p>
      *
-     * @param messages The messages to copy to the specified folder.
-     * @param folder The name of the target folder.
+     * @param messages
+     *         The messages to copy to the specified folder.
+     * @param folder
+     *         The name of the target folder.
      *
      * @return The mapping of original message UIDs to the new server UIDs.
      */
-    @Throws(MessagingException::class)
-    fun copyMessages(messages: List<ImapMessage>, folder: ImapFolder): Map<String, String>? {
-        if (messages.isEmpty()) {
-            return null
+    @Override
+    public Map<String, String> copyMessages(List<? extends Message> messages, Folder folder) throws MessagingException {
+        if (!(folder instanceof ImapFolder)) {
+            throw new MessagingException("ImapFolder.copyMessages passed non-ImapFolder");
         }
 
-        checkOpen() // only need READ access
+        if (messages.isEmpty()) {
+            return null;
+        }
 
-        val uids = messages.map { it.uid.toLong() }.toSet()
-        val encodedDestinationFolderName = folderNameCodec.encode(folder.prefixedName)
-        val escapedDestinationFolderName = ImapUtility.encodeString(encodedDestinationFolderName)
+        ImapFolder imapFolder = (ImapFolder) folder;
+        checkOpen(); //only need READ access
 
-        // TODO: Just perform the operation and only check for existence of the folder if the operation fails.
+        Set<Long> uids = new HashSet<>(messages.size());
+        for (int i = 0, count = messages.size(); i < count; i++) {
+            uids.add(Long.parseLong(messages.get(i).getUid()));
+        }
+
+        String encodedDestinationFolderName = folderNameCodec.encode(imapFolder.getPrefixedName());
+        String escapedDestinationFolderName = ImapUtility.encodeString(encodedDestinationFolderName);
+
+        //TODO: Just perform the operation and only check for existence of the folder if the operation fails.
         if (!exists(escapedDestinationFolderName)) {
             if (K9MailLib.isDebug()) {
-                Timber.i(
-                    "ImapFolder.copyMessages: couldn't find remote folder '%s' for %s",
-                    escapedDestinationFolderName, logId
-                )
+                Timber.i("ImapFolder.copyMessages: couldn't find remote folder '%s' for %s",
+                        escapedDestinationFolderName, getLogId());
             }
 
-            throw FolderNotFoundException(folder.serverId)
+            throw new FolderNotFoundException(imapFolder.getServerId());
         }
-
-        return try {
-            val imapResponses = connection!!.executeCommandWithIdSet(
-                Commands.UID_COPY,
-                escapedDestinationFolderName,
-                uids
-            )
-
-            UidCopyResponse.parse(imapResponses)?.uidMapping
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
-        }
-    }
-
-    @Throws(MessagingException::class)
-    fun moveMessages(messages: List<ImapMessage>, folder: ImapFolder): Map<String, String>? {
-        if (messages.isEmpty()) {
-            return null
-        }
-
-        val uidMapping = copyMessages(messages, folder)
-        setFlags(messages, setOf(Flag.DELETED), true)
-
-        return uidMapping
-    }
-
-    @Throws(MessagingException::class)
-    private fun getRemoteMessageCount(criteria: String): Int {
-        checkOpen()
 
         try {
-            val command = String.format(Locale.US, "SEARCH 1:* %s", criteria)
-            val responses = executeSimpleCommand(command)
+            List<ImapResponse> imapResponses = connection.executeCommandWithIdSet(Commands.UID_COPY,
+                    escapedDestinationFolderName, uids);
 
-            return responses.sumBy { response ->
-                if (ImapResponseParser.equalsIgnoreCase(response[0], "SEARCH")) {
-                    response.size - 1
-                } else {
-                    0
+            UidCopyResponse response = UidCopyResponse.parse(imapResponses);
+            return response == null ? null : response.getUidMapping();
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
+        }
+    }
+
+    @Override
+    public Map<String, String> moveMessages(List<? extends Message> messages, Folder folder) throws MessagingException {
+        if (messages.isEmpty()) {
+            return null;
+        }
+
+        Map<String, String> uidMapping = copyMessages(messages, folder);
+
+        setFlags(messages, Collections.singleton(Flag.DELETED), true);
+
+        return uidMapping;
+    }
+
+    @Override
+    public int getMessageCount() {
+        return messageCount;
+    }
+
+    private int getRemoteMessageCount(String criteria) throws MessagingException {
+        checkOpen();
+
+        try {
+            int count = 0;
+            int start = 1;
+
+            String command = String.format(Locale.US, "SEARCH %d:* %s", start, criteria);
+            List<ImapResponse> responses = executeSimpleCommand(command);
+
+            for (ImapResponse response : responses) {
+                if (ImapResponseParser.equalsIgnoreCase(response.get(0), "SEARCH")) {
+                    count += response.size() - 1;
                 }
             }
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+
+            return count;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    @get:Throws(MessagingException::class)
-    val unreadMessageCount: Int
-        get() = getRemoteMessageCount("UNSEEN NOT DELETED")
+    @Override
+    public int getUnreadMessageCount() throws MessagingException {
+        return getRemoteMessageCount("UNSEEN NOT DELETED");
+    }
 
-    @get:Throws(MessagingException::class)
-    val flaggedMessageCount: Int
-        get() = getRemoteMessageCount("FLAGGED NOT DELETED")
+    @Override
+    public int getFlaggedMessageCount() throws MessagingException {
+        return getRemoteMessageCount("FLAGGED NOT DELETED");
+    }
 
-    @get:Throws(MessagingException::class)
-    internal val highestUid: Long
-        get() = try {
-            val responses = executeSimpleCommand("UID SEARCH *:*")
-            val searchResponse = SearchResponse.parse(responses)
+    protected long getHighestUid() throws MessagingException {
+        try {
+            List<ImapResponse> responses = executeSimpleCommand("UID SEARCH *:*");
 
-            extractHighestUid(searchResponse)
-        } catch (e: NegativeImapResponseException) {
-            -1L
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            SearchResponse searchResponse = SearchResponse.parse(responses);
+            return extractHighestUid(searchResponse);
+        } catch (NegativeImapResponseException e) {
+            return -1L;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
+        }
+    }
+
+    private long extractHighestUid(SearchResponse searchResponse) {
+        List<Long> uids = searchResponse.getNumbers();
+        if (uids.isEmpty()) {
+            return -1L;
         }
 
-    private fun extractHighestUid(searchResponse: SearchResponse): Long {
-        return searchResponse.numbers.max() ?: -1L
+        if (uids.size() == 1) {
+            return uids.get(0);
+        }
+
+        Collections.sort(uids, Collections.reverseOrder());
+
+        return uids.get(0);
     }
 
-    fun getMessage(uid: String): ImapMessage {
-        return ImapMessage(uid)
+    @Override
+    public ImapMessage getMessage(String uid) throws MessagingException {
+        return new ImapMessage(uid, this);
     }
 
-    @Throws(MessagingException::class)
-    fun getMessages(
-        start: Int,
-        end: Int,
-        earliestDate: Date?,
-        listener: MessageRetrievalListener<ImapMessage>?
-    ): List<ImapMessage> {
-        return getMessages(start, end, earliestDate, false, listener)
+    @Override
+    public List<ImapMessage> getMessages(int start, int end, Date earliestDate,
+            MessageRetrievalListener<ImapMessage> listener) throws MessagingException {
+        return getMessages(start, end, earliestDate, false, listener);
     }
 
-    @Throws(MessagingException::class)
-    private fun getMessages(
-        start: Int,
-        end: Int,
-        earliestDate: Date?,
-        includeDeleted: Boolean,
-        listener: MessageRetrievalListener<ImapMessage>?
-    ): List<ImapMessage> {
+    protected List<ImapMessage> getMessages(final int start, final int end, Date earliestDate,
+            final boolean includeDeleted, final MessageRetrievalListener<ImapMessage> listener)
+            throws MessagingException {
+
         if (start < 1 || end < 1 || end < start) {
-            throw MessagingException(String.format(Locale.US, "Invalid message set %d %d", start, end))
+            throw new MessagingException(String.format(Locale.US, "Invalid message set %d %d", start, end));
         }
 
-        checkOpen()
+        checkOpen();
 
-        val dateSearchString = getDateSearchString(earliestDate)
-        val command = String.format(Locale.US, "UID SEARCH %d:%d%s%s",
-            start,
-            end,
-            dateSearchString,
-            if (includeDeleted) "" else " NOT DELETED"
-        )
+        String dateSearchString = getDateSearchString(earliestDate);
+        String command = String.format(Locale.US, "UID SEARCH %d:%d%s%s", start, end, dateSearchString,
+                includeDeleted ? "" : " NOT DELETED");
 
         try {
-            val imapResponses = connection!!.executeSimpleCommand(command)
-            val searchResponse = SearchResponse.parse(imapResponses)
-            return getMessages(searchResponse, listener)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            List<ImapResponse> imapResponses = connection.executeSimpleCommand(command);
+            SearchResponse searchResponse = SearchResponse.parse(imapResponses);
+            return getMessages(searchResponse, listener);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    private fun getDateSearchString(earliestDate: Date?): String {
-        return if (earliestDate == null) {
-            ""
-        } else {
-            " SINCE " + RFC3501_DATE.get()!!.format(earliestDate)
+    private String getDateSearchString(Date earliestDate) {
+        if (earliestDate == null) {
+            return "";
         }
+
+        return " SINCE " + RFC3501_DATE.get().format(earliestDate);
     }
 
-    @Throws(IOException::class, MessagingException::class)
-    fun areMoreMessagesAvailable(indexOfOldestMessage: Int, earliestDate: Date?): Boolean {
-        checkOpen()
+    @Override
+    public boolean areMoreMessagesAvailable(int indexOfOldestMessage, Date earliestDate) throws IOException,
+            MessagingException {
+
+        checkOpen();
 
         if (indexOfOldestMessage == 1) {
-            return false
+            return false;
         }
 
-        var endIndex = indexOfOldestMessage - 1
-        val dateSearchString = getDateSearchString(earliestDate)
+        int endIndex = indexOfOldestMessage - 1;
+        String dateSearchString = getDateSearchString(earliestDate);
 
         while (endIndex > 0) {
-            val startIndex = max(0, endIndex - MORE_MESSAGES_WINDOW_SIZE) + 1
+            int startIndex = Math.max(0, endIndex - MORE_MESSAGES_WINDOW_SIZE) + 1;
+
             if (existsNonDeletedMessageInRange(startIndex, endIndex, dateSearchString)) {
-                return true
+                return true;
             }
-            endIndex -= MORE_MESSAGES_WINDOW_SIZE
+
+            endIndex = endIndex - MORE_MESSAGES_WINDOW_SIZE;
         }
 
-        return false
+        return false;
     }
 
-    @Throws(MessagingException::class, IOException::class)
-    private fun existsNonDeletedMessageInRange(startIndex: Int, endIndex: Int, dateSearchString: String): Boolean {
-        val command = String.format(
-            Locale.US, "SEARCH %d:%d%s NOT DELETED",
-            startIndex, endIndex, dateSearchString
-        )
-        val imapResponses = executeSimpleCommand(command)
+    private boolean existsNonDeletedMessageInRange(int startIndex, int endIndex, String dateSearchString)
+            throws MessagingException, IOException {
 
-        val response = SearchResponse.parse(imapResponses)
-        return response.numbers.size > 0
+        String command = String.format(Locale.US, "SEARCH %d:%d%s NOT DELETED",
+                startIndex, endIndex, dateSearchString);
+        List<ImapResponse> imapResponses = executeSimpleCommand(command);
+
+        SearchResponse response = SearchResponse.parse(imapResponses);
+        return response.getNumbers().size() > 0;
     }
 
-    @Throws(MessagingException::class)
-    internal fun getMessages(
-        mesgSeqs: Set<Long?>?,
-        includeDeleted: Boolean,
-        listener: MessageRetrievalListener<ImapMessage>?
-    ): List<ImapMessage> {
-        checkOpen()
+    protected List<ImapMessage> getMessages(final Set<Long> mesgSeqs, final boolean includeDeleted,
+            final MessageRetrievalListener<ImapMessage> listener) throws MessagingException {
+
+        checkOpen();
 
         try {
-            val commandSuffix = if (includeDeleted) "" else " NOT DELETED"
-            val imapResponses = connection!!.executeCommandWithIdSet(Commands.UID_SEARCH, commandSuffix, mesgSeqs)
+            String commandSuffix = includeDeleted ? "" : " NOT DELETED";
+            List<ImapResponse> imapResponses = connection.executeCommandWithIdSet(Commands.UID_SEARCH,
+                    commandSuffix, mesgSeqs);
 
-            val searchResponse = SearchResponse.parse(imapResponses)
-            return getMessages(searchResponse, listener)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            SearchResponse searchResponse = SearchResponse.parse(imapResponses);
+            return getMessages(searchResponse, listener);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    @Throws(MessagingException::class)
-    internal fun getMessagesFromUids(mesgUids: List<String>): List<ImapMessage> {
-        checkOpen()
+    protected List<ImapMessage> getMessagesFromUids(final List<String> mesgUids) throws MessagingException {
 
-        val uidSet = mesgUids.map { it.toLong() }.toSet()
+        checkOpen();
+        Set<Long> uidSet = new HashSet<>();
+        for (String uid : mesgUids) {
+            uidSet.add(Long.parseLong(uid));
+        }
 
         try {
-            val imapResponses = connection!!.executeCommandWithIdSet("UID SEARCH UID", "", uidSet)
+            List<ImapResponse> imapResponses = connection.executeCommandWithIdSet("UID SEARCH UID", "", uidSet);
 
-            val searchResponse = SearchResponse.parse(imapResponses)
-            return getMessages(searchResponse, null)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            SearchResponse searchResponse = SearchResponse.parse(imapResponses);
+            return getMessages(searchResponse, null);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    private fun getMessages(
-        searchResponse: SearchResponse,
-        listener: MessageRetrievalListener<ImapMessage>?
-    ): List<ImapMessage> {
+    private List<ImapMessage> getMessages(SearchResponse searchResponse, MessageRetrievalListener<ImapMessage> listener)
+            throws MessagingException {
+
+        List<ImapMessage> messages = new ArrayList<>();
+        List<Long> uids = searchResponse.getNumbers();
+
         // Sort the uids in numerically decreasing order
         // By doing it in decreasing order, we ensure newest messages are dealt with first
         // This makes the most sense when a limit is imposed, and also prevents UI from going
         // crazy adding stuff at the top.
-        val uids = searchResponse.numbers.sortedDescending()
+        Collections.sort(uids, Collections.reverseOrder());
 
-        val count = uids.size
-        return uids.mapIndexed { index, uidLong ->
-            val uid = uidLong.toString()
-            listener?.messageStarted(uid, index, count)
-            val message = ImapMessage(uid)
-            listener?.messageFinished(message, index, count)
+        for (int i = 0, count = uids.size(); i < count; i++) {
+            String uid = uids.get(i).toString();
+            if (listener != null) {
+                listener.messageStarted(uid, i, count);
+            }
 
-            message
+            ImapMessage message = new ImapMessage(uid, this);
+            messages.add(message);
+
+            if (listener != null) {
+                listener.messageFinished(message, i, count);
+            }
         }
+
+        return messages;
     }
 
-    @Throws(MessagingException::class)
-    fun fetch(
-        messages: List<ImapMessage>?,
-        fetchProfile: FetchProfile,
-        listener: MessageRetrievalListener<ImapMessage?>?,
-        maxDownloadSize: Int
-    ) {
+    @Override
+    public void fetch(List<ImapMessage> messages, FetchProfile fetchProfile,
+            MessageRetrievalListener<ImapMessage> listener) throws MessagingException {
         if (messages == null || messages.isEmpty()) {
-            return
+            return;
         }
 
-        checkOpen()
+        checkOpen();
 
-        val messageMap = messages.associateBy { it.uid }
-        val uids = messages.map { it.uid }
+        List<String> uids = new ArrayList<>(messages.size());
+        HashMap<String, Message> messageMap = new HashMap<>();
+        for (Message message : messages) {
+            String uid = message.getUid();
+            uids.add(uid);
+            messageMap.put(uid, message);
+        }
 
-        val fetchFields: MutableSet<String> = LinkedHashSet()
-        fetchFields.add("UID")
+        Set<String> fetchFields = new LinkedHashSet<>();
+        fetchFields.add("UID");
+
         if (fetchProfile.contains(FetchProfile.Item.FLAGS)) {
-            fetchFields.add("FLAGS")
+            fetchFields.add("FLAGS");
         }
 
         if (fetchProfile.contains(FetchProfile.Item.ENVELOPE)) {
-            fetchFields.add("INTERNALDATE")
-            fetchFields.add("RFC822.SIZE")
-            fetchFields.add(
-                "BODY.PEEK[HEADER.FIELDS (date subject from content-type to cc " +
-                    "reply-to message-id references in-reply-to " + K9MailLib.IDENTITY_HEADER + ")]"
-            )
+            fetchFields.add("INTERNALDATE");
+            fetchFields.add("RFC822.SIZE");
+            fetchFields.add("BODY.PEEK[HEADER.FIELDS (date subject from content-type to cc " +
+                    "reply-to message-id references in-reply-to " + K9MailLib.IDENTITY_HEADER + ")]");
         }
 
         if (fetchProfile.contains(FetchProfile.Item.STRUCTURE)) {
-            fetchFields.add("BODYSTRUCTURE")
+            fetchFields.add("BODYSTRUCTURE");
         }
 
         if (fetchProfile.contains(FetchProfile.Item.BODY_SANE)) {
-            if (maxDownloadSize > 0) {
-                fetchFields.add(String.format(Locale.US, "BODY.PEEK[]<0.%d>", maxDownloadSize))
+            int maximumAutoDownloadMessageSize = store.getStoreConfig().getMaximumAutoDownloadMessageSize();
+            if (maximumAutoDownloadMessageSize > 0) {
+                fetchFields.add(String.format(Locale.US, "BODY.PEEK[]<0.%d>", maximumAutoDownloadMessageSize));
             } else {
-                fetchFields.add("BODY.PEEK[]")
+                fetchFields.add("BODY.PEEK[]");
             }
         }
 
         if (fetchProfile.contains(FetchProfile.Item.BODY)) {
-            fetchFields.add("BODY.PEEK[]")
+            fetchFields.add("BODY.PEEK[]");
         }
 
-        val spaceSeparatedFetchFields = ImapUtility.join(" ", fetchFields)
-        var windowStart = 0
-        while (windowStart < messages.size) {
-            val windowEnd = min(windowStart + FETCH_WINDOW_SIZE, messages.size)
-            val uidWindow = uids.subList(windowStart, windowEnd)
+        String spaceSeparatedFetchFields = ImapUtility.join(" ", fetchFields);
+
+        for (int windowStart = 0; windowStart < messages.size(); windowStart += (FETCH_WINDOW_SIZE)) {
+            int windowEnd = Math.min(windowStart + FETCH_WINDOW_SIZE, messages.size());
+            List<String> uidWindow = uids.subList(windowStart, windowEnd);
 
             try {
-                val commaSeparatedUids = ImapUtility.join(",", uidWindow)
-                val command = String.format("UID FETCH %s (%s)", commaSeparatedUids, spaceSeparatedFetchFields)
-                connection!!.sendCommand(command, false)
+                String commaSeparatedUids = ImapUtility.join(",", uidWindow);
+                String command = String.format("UID FETCH %s (%s)", commaSeparatedUids, spaceSeparatedFetchFields);
+                connection.sendCommand(command, false);
 
-                var messageNumber = 0
-                var callback: ImapResponseCallback? = null
+                ImapResponse response;
+                int messageNumber = 0;
+
+                ImapResponseCallback callback = null;
                 if (fetchProfile.contains(FetchProfile.Item.BODY) ||
-                    fetchProfile.contains(FetchProfile.Item.BODY_SANE)) {
-                    callback = FetchBodyCallback(messageMap)
+                        fetchProfile.contains(FetchProfile.Item.BODY_SANE)) {
+                    callback = new FetchBodyCallback(messageMap);
                 }
 
-                var response: ImapResponse
                 do {
-                    response = connection!!.readResponse(callback)
-                    if (response.tag == null && ImapResponseParser.equalsIgnoreCase(response[1], "FETCH")) {
-                        val fetchList = response.getKeyedValue("FETCH") as ImapList
-                        val uid = fetchList.getKeyedString("UID")
-                        val msgSeq = response.getLong(0)
+                    response = connection.readResponse(callback);
+
+                    if (response.getTag() == null && ImapResponseParser.equalsIgnoreCase(response.get(1), "FETCH")) {
+                        ImapList fetchList = (ImapList) response.getKeyedValue("FETCH");
+                        String uid = fetchList.getKeyedString("UID");
+                        long msgSeq = response.getLong(0);
                         if (uid != null) {
                             try {
-                                msgSeqUidMap[msgSeq] = uid
+                                msgSeqUidMap.put(msgSeq, uid);
                                 if (K9MailLib.isDebug()) {
-                                    Timber.v("Stored uid '%s' for msgSeq %d into map", uid, msgSeq)
+                                    Timber.v("Stored uid '%s' for msgSeq %d into map", uid, msgSeq);
                                 }
-                            } catch (e: Exception) {
-                                Timber.e("Unable to store uid '%s' for msgSeq %d", uid, msgSeq)
+                            } catch (Exception e) {
+                                Timber.e("Unable to store uid '%s' for msgSeq %d", uid, msgSeq);
                             }
                         }
 
-                        val message = messageMap[uid]
+                        Message message = messageMap.get(uid);
                         if (message == null) {
                             if (K9MailLib.isDebug()) {
-                                Timber.d("Do not have message in messageMap for UID %s for %s", uid, logId)
+                                Timber.d("Do not have message in messageMap for UID %s for %s", uid, getLogId());
                             }
-                            handleUntaggedResponse(response)
-                            continue
+
+                            handleUntaggedResponse(response);
+                            continue;
                         }
 
-                        listener?.messageStarted(uid, messageNumber++, messageMap.size)
+                        if (listener != null) {
+                            listener.messageStarted(uid, messageNumber++, messageMap.size());
+                        }
 
-                        val literal = handleFetchResponse(message, fetchList)
+                        ImapMessage imapMessage = (ImapMessage) message;
+                        Object literal = handleFetchResponse(imapMessage, fetchList);
+
                         if (literal != null) {
-                            when (literal) {
-                                is String -> {
-                                    val bodyStream: InputStream = ByteArrayInputStream(literal.toByteArray())
-                                    message.parse(bodyStream)
-                                }
-                                is Int -> {
-                                    // All the work was done in FetchBodyCallback.foundLiteral()
-                                }
-                                else -> {
-                                    // This shouldn't happen
-                                    throw MessagingException("Got FETCH response with bogus parameters")
-                                }
+                            if (literal instanceof String) {
+                                String bodyString = (String) literal;
+                                InputStream bodyStream = new ByteArrayInputStream(bodyString.getBytes());
+                                imapMessage.parse(bodyStream);
+                            } else if (literal instanceof Integer) {
+                                // All the work was done in FetchBodyCallback.foundLiteral()
+                            } else {
+                                // This shouldn't happen
+                                throw new MessagingException("Got FETCH response with bogus parameters");
                             }
                         }
 
-                        listener?.messageFinished(message, messageNumber, messageMap.size)
+                        if (listener != null) {
+                            listener.messageFinished(imapMessage, messageNumber, messageMap.size());
+                        }
                     } else {
-                        handleUntaggedResponse(response)
+                        handleUntaggedResponse(response);
                     }
-                } while (response.tag == null)
-            } catch (ioe: IOException) {
-                throw ioExceptionHandler(connection, ioe)
-            }
 
-            windowStart += FETCH_WINDOW_SIZE
+                } while (response.getTag() == null);
+            } catch (IOException ioe) {
+                throw ioExceptionHandler(connection, ioe);
+            }
         }
     }
 
-    @Throws(MessagingException::class)
-    fun fetchPart(
-        message: ImapMessage,
-        part: Part,
-        listener: MessageRetrievalListener<ImapMessage?>?,
-        bodyFactory: BodyFactory,
-        maxDownloadSize: Int
-    ) {
-        checkOpen()
+    @Override
+    public void fetchPart(Message message, Part part, MessageRetrievalListener<Message> listener,
+            BodyFactory bodyFactory) throws MessagingException {
+        checkOpen();
 
-        val partId = part.serverExtra
+        String partId = part.getServerExtra();
 
-        val fetch = if ("TEXT".equals(partId, ignoreCase = true)) {
-            String.format(Locale.US, "BODY.PEEK[TEXT]<0.%d>", maxDownloadSize)
+        String fetch;
+        if ("TEXT".equalsIgnoreCase(partId)) {
+            int maximumAutoDownloadMessageSize = store.getStoreConfig().getMaximumAutoDownloadMessageSize();
+            fetch = String.format(Locale.US, "BODY.PEEK[TEXT]<0.%d>", maximumAutoDownloadMessageSize);
         } else {
-            String.format("BODY.PEEK[%s]", partId)
+            fetch = String.format("BODY.PEEK[%s]", partId);
         }
 
         try {
-            val command = String.format("UID FETCH %s (UID %s)", message.uid, fetch)
-            connection!!.sendCommand(command, false)
+            String command = String.format("UID FETCH %s (UID %s)", message.getUid(), fetch);
+            connection.sendCommand(command, false);
 
-            var messageNumber = 0
-            val callback: ImapResponseCallback = FetchPartCallback(part, bodyFactory)
+            ImapResponse response;
+            int messageNumber = 0;
 
-            var response: ImapResponse
+            ImapResponseCallback callback = new FetchPartCallback(part, bodyFactory);
+
             do {
-                response = connection!!.readResponse(callback)
+                response = connection.readResponse(callback);
 
-                if (response.tag == null && ImapResponseParser.equalsIgnoreCase(response[1], "FETCH")) {
-                    val fetchList = response.getKeyedValue("FETCH") as ImapList
-                    val uid = fetchList.getKeyedString("UID")
-                    if (message.uid != uid) {
+                if (response.getTag() == null && ImapResponseParser.equalsIgnoreCase(response.get(1), "FETCH")) {
+                    ImapList fetchList = (ImapList) response.getKeyedValue("FETCH");
+                    String uid = fetchList.getKeyedString("UID");
+
+                    if (!message.getUid().equals(uid)) {
                         if (K9MailLib.isDebug()) {
-                            Timber.d("Did not ask for UID %s for %s", uid, logId)
+                            Timber.d("Did not ask for UID %s for %s", uid, getLogId());
                         }
-                        handleUntaggedResponse(response)
-                        continue
+
+                        handleUntaggedResponse(response);
+                        continue;
                     }
 
-                    listener?.messageStarted(uid, messageNumber++, 1)
+                    if (listener != null) {
+                        listener.messageStarted(uid, messageNumber++, 1);
+                    }
 
-                    val literal = handleFetchResponse(message, fetchList)
+                    ImapMessage imapMessage = (ImapMessage) message;
+
+                    Object literal = handleFetchResponse(imapMessage, fetchList);
+
                     if (literal != null) {
-                        when (literal) {
-                            is Body -> {
-                                // Most of the work was done in FetchAttachmentCallback.foundLiteral()
-                                MimeMessageHelper.setBody(part, literal as Body?)
-                            }
-                            is String -> {
-                                val bodyStream: InputStream = ByteArrayInputStream(literal.toByteArray())
-                                val contentTransferEncoding =
-                                    part.getHeader(MimeHeader.HEADER_CONTENT_TRANSFER_ENCODING)[0]
-                                val contentType = part.getHeader(MimeHeader.HEADER_CONTENT_TYPE)[0]
-                                val body = bodyFactory.createBody(contentTransferEncoding, contentType, bodyStream)
-                                MimeMessageHelper.setBody(part, body)
-                            }
-                            else -> {
-                                // This shouldn't happen
-                                throw MessagingException("Got FETCH response with bogus parameters")
-                            }
+                        if (literal instanceof Body) {
+                            // Most of the work was done in FetchAttachmentCallback.foundLiteral()
+                            MimeMessageHelper.setBody(part, (Body) literal);
+                        } else if (literal instanceof String) {
+                            String bodyString = (String) literal;
+                            InputStream bodyStream = new ByteArrayInputStream(bodyString.getBytes());
+
+                            String contentTransferEncoding =
+                                    part.getHeader(MimeHeader.HEADER_CONTENT_TRANSFER_ENCODING)[0];
+                            String contentType = part.getHeader(MimeHeader.HEADER_CONTENT_TYPE)[0];
+                            Body body = bodyFactory.createBody(contentTransferEncoding, contentType, bodyStream);
+                            MimeMessageHelper.setBody(part, body);
+                        } else {
+                            // This shouldn't happen
+                            throw new MessagingException("Got FETCH response with bogus parameters");
                         }
                     }
 
-                    listener?.messageFinished(message, messageNumber, 1)
+                    if (listener != null) {
+                        listener.messageFinished(message, messageNumber, 1);
+                    }
                 } else {
-                    handleUntaggedResponse(response)
+                    handleUntaggedResponse(response);
                 }
-            } while (response.tag == null)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+
+            } while (response.getTag() == null);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
     // Returns value of body field
-    @Throws(MessagingException::class)
-    private fun handleFetchResponse(message: ImapMessage, fetchList: ImapList): Any? {
-        var result: Any? = null
+    private Object handleFetchResponse(ImapMessage message, ImapList fetchList) throws MessagingException {
+        Object result = null;
         if (fetchList.containsKey("FLAGS")) {
-            val flags = fetchList.getKeyedList("FLAGS")
+            ImapList flags = fetchList.getKeyedList("FLAGS");
             if (flags != null) {
-                for (i in flags.indices) {
-                    val flag = flags.getString(i)
-                    when {
-                        flag.equals("\\Deleted", ignoreCase = true) -> {
-                            message.setFlag(Flag.DELETED, true)
-                        }
-                        flag.equals("\\Answered", ignoreCase = true) -> {
-                            message.setFlag(Flag.ANSWERED, true)
-                        }
-                        flag.equals("\\Seen", ignoreCase = true) -> {
-                            message.setFlag(Flag.SEEN, true)
-                        }
-                        flag.equals("\\Flagged", ignoreCase = true) -> {
-                            message.setFlag(Flag.FLAGGED, true)
-                        }
-                        flag.equals("\$Forwarded", ignoreCase = true) -> {
-                            message.setFlag(Flag.FORWARDED, true)
-                            // a message contains FORWARDED FLAG -> so we can also create them
-                            store.permanentFlagsIndex.add(Flag.FORWARDED)
-                        }
-                        flag.equals("\\Draft", ignoreCase = true) -> {
-                            message.setFlag(Flag.DRAFT, true)
-                        }
+                for (int i = 0, count = flags.size(); i < count; i++) {
+                    String flag = flags.getString(i);
+                    if (flag.equalsIgnoreCase("\\Deleted")) {
+                        message.setFlagInternal(Flag.DELETED, true);
+                    } else if (flag.equalsIgnoreCase("\\Answered")) {
+                        message.setFlagInternal(Flag.ANSWERED, true);
+                    } else if (flag.equalsIgnoreCase("\\Seen")) {
+                        message.setFlagInternal(Flag.SEEN, true);
+                    } else if (flag.equalsIgnoreCase("\\Flagged")) {
+                        message.setFlagInternal(Flag.FLAGGED, true);
+                    } else if (flag.equalsIgnoreCase("$Forwarded")) {
+                        message.setFlagInternal(Flag.FORWARDED, true);
+                        /* a message contains FORWARDED FLAG -> so we can also create them */
+                        store.getPermanentFlagsIndex().add(Flag.FORWARDED);
+                    } else if (flag.equalsIgnoreCase("\\Draft")){
+                        message.setFlagInternal(Flag.DRAFT, true);
                     }
                 }
             }
         }
 
         if (fetchList.containsKey("INTERNALDATE")) {
-            message.internalDate = fetchList.getKeyedDate("INTERNALDATE")
+            Date internalDate = fetchList.getKeyedDate("INTERNALDATE");
+            message.setInternalDate(internalDate);
         }
 
         if (fetchList.containsKey("RFC822.SIZE")) {
-            val size = fetchList.getKeyedNumber("RFC822.SIZE")
-            message.setSize(size)
+            int size = fetchList.getKeyedNumber("RFC822.SIZE");
+            message.setSize(size);
         }
 
         if (fetchList.containsKey("BODYSTRUCTURE")) {
-            val bs = fetchList.getKeyedList("BODYSTRUCTURE")
+            ImapList bs = fetchList.getKeyedList("BODYSTRUCTURE");
             if (bs != null) {
                 try {
-                    parseBodyStructure(bs, message, "TEXT")
-                } catch (e: MessagingException) {
+                    parseBodyStructure(bs, message, "TEXT");
+                } catch (MessagingException e) {
                     if (K9MailLib.isDebug()) {
-                        Timber.d(e, "Error handling message for %s", logId)
+                        Timber.d(e, "Error handling message for %s", getLogId());
                     }
-                    message.body = null
+                    message.setBody(null);
                 }
             }
         }
 
         if (fetchList.containsKey("BODY")) {
-            val index = fetchList.getKeyIndex("BODY") + 2
-            val size = fetchList.size
+            int index = fetchList.getKeyIndex("BODY") + 2;
+            int size = fetchList.size();
             if (index < size) {
-                result = fetchList.getObject(index)
+                result = fetchList.getObject(index);
 
                 // Check if there's an origin octet
-                if (result is String) {
-                    if (result.startsWith("<") && index + 1 < size) {
-                        result = fetchList.getObject(index + 1)
+                if (result instanceof String) {
+                    String originOctet = (String) result;
+                    if (originOctet.startsWith("<") && (index + 1) < size) {
+                        result = fetchList.getObject(index + 1);
                     }
                 }
             }
         }
 
-        return result
+        return result;
     }
 
-    private fun handleUntaggedResponses(responses: List<ImapResponse>): List<ImapResponse> {
-        for (response in responses) {
-            handleUntaggedResponse(response)
+    protected List<ImapResponse> handleUntaggedResponses(List<ImapResponse> responses) {
+        for (ImapResponse response : responses) {
+            handleUntaggedResponse(response);
         }
-        return responses
+
+        return responses;
     }
 
-    private fun handlePossibleUidNext(response: ImapResponse) {
-        if (ImapResponseParser.equalsIgnoreCase(response[0], "OK") && response.size > 1) {
-            val bracketed = response[1] as? ImapList ?: return
-            val key = bracketed.firstOrNull() as? String ?: return
-            if ("UIDNEXT".equals(key, ignoreCase = true)) {
-                uidNext = bracketed.getLong(1)
-                if (K9MailLib.isDebug()) {
-                    Timber.d("Got UidNext = %s for %s", uidNext, logId)
+    protected void handlePossibleUidNext(ImapResponse response) {
+        if (ImapResponseParser.equalsIgnoreCase(response.get(0), "OK") && response.size() > 1) {
+            Object bracketedObj = response.get(1);
+            if (bracketedObj instanceof ImapList) {
+                ImapList bracketed = (ImapList) bracketedObj;
+
+                if (bracketed.size() > 1) {
+                    Object keyObj = bracketed.get(0);
+                    if (keyObj instanceof String) {
+                        String key = (String) keyObj;
+                        if ("UIDNEXT".equalsIgnoreCase(key)) {
+                            uidNext = bracketed.getLong(1);
+                            if (K9MailLib.isDebug()) {
+                                Timber.d("Got UidNext = %s for %s", uidNext, getLogId());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -820,53 +911,61 @@ class ImapFolder internal constructor(
     /**
      * Handle an untagged response that the caller doesn't care to handle themselves.
      */
-    private fun handleUntaggedResponse(response: ImapResponse) {
-        if (response.tag == null && response.size > 1) {
-            if (ImapResponseParser.equalsIgnoreCase(response[1], "EXISTS")) {
-                messageCount = response.getNumber(0)
+    protected void handleUntaggedResponse(ImapResponse response) {
+        if (response.getTag() == null && response.size() > 1) {
+            if (ImapResponseParser.equalsIgnoreCase(response.get(1), "EXISTS")) {
+                messageCount = response.getNumber(0);
                 if (K9MailLib.isDebug()) {
-                    Timber.d("Got untagged EXISTS with value %d for %s", messageCount, logId)
+                    Timber.d("Got untagged EXISTS with value %d for %s", messageCount, getLogId());
                 }
             }
 
-            handlePossibleUidNext(response)
+            handlePossibleUidNext(response);
 
-            if (ImapResponseParser.equalsIgnoreCase(response[1], "EXPUNGE") && messageCount > 0) {
-                messageCount--
+            if (ImapResponseParser.equalsIgnoreCase(response.get(1), "EXPUNGE") && messageCount > 0) {
+                messageCount--;
                 if (K9MailLib.isDebug()) {
-                    Timber.d("Got untagged EXPUNGE with messageCount %d for %s", messageCount, logId)
+                    Timber.d("Got untagged EXPUNGE with messageCount %d for %s", messageCount, getLogId());
                 }
             }
         }
     }
 
-    @Throws(MessagingException::class)
-    private fun parseBodyStructure(bs: ImapList, part: Part, id: String) {
-        if (bs[0] is ImapList) {
-            // This is a multipart
-            val mp = MimeMultipart.newInstance()
-            for (i in bs.indices) {
-                if (bs[i] is ImapList) {
-                    // For each part in the message we're going to add a new BodyPart and parse into it.
-                    val bp = MimeBodyPart()
-                    val bodyPartId = (i + 1).toString()
-                    if (id.equals("TEXT", ignoreCase = true)) {
-                        parseBodyStructure(bs.getList(i), bp, bodyPartId)
+    private void parseBodyStructure(ImapList bs, Part part, String id) throws MessagingException {
+        if (bs.get(0) instanceof ImapList) {
+            /*
+             * This is a multipart/*
+             */
+            MimeMultipart mp = MimeMultipart.newInstance();
+            for (int i = 0, count = bs.size(); i < count; i++) {
+                if (bs.get(i) instanceof ImapList) {
+                    /*
+                     * For each part in the message we're going to add a new BodyPart and parse
+                     * into it.
+                     */
+                    MimeBodyPart bp = new MimeBodyPart();
+                    if (id.equalsIgnoreCase("TEXT")) {
+                        parseBodyStructure(bs.getList(i), bp, Integer.toString(i + 1));
                     } else {
-                        parseBodyStructure(bs.getList(i), bp, "$id.$bodyPartId")
+                        parseBodyStructure(bs.getList(i), bp, id + "." + (i + 1));
                     }
-                    mp.addBodyPart(bp)
+                    mp.addBodyPart(bp);
                 } else {
-                    // We've got to the end of the children of the part, so now we can find out what type it is and
-                    // bail out.
-                    val subType = bs.getString(i)
-                    mp.setSubType(subType.toLowerCase(Locale.US))
-                    break
+                    /*
+                     * We've got to the end of the children of the part, so now we can find out
+                     * what type it is and bail out.
+                     */
+                    String subType = bs.getString(i);
+                    mp.setSubType(subType.toLowerCase(Locale.US));
+                    break;
                 }
             }
-            MimeMessageHelper.setBody(part, mp)
+            MimeMessageHelper.setBody(part, mp);
         } else {
-            // This is a body. We need to add as much information as we can find out about it to the Part.
+            /*
+             * This is a body. We need to add as much information as we can find out about
+             * it to the Part.
+             */
 
             /*
              *  0| 0  body type
@@ -883,16 +982,17 @@ class ImapFolder internal constructor(
              *  9|10  body language (unused)
              * 10|11  body location (unused)
              */
-            val type = bs.getString(0)
-            val subType = bs.getString(1)
-            val mimeType = "$type/$subType".toLowerCase(Locale.US)
 
-            var bodyParams: ImapList? = null
-            if (bs[2] is ImapList) {
-                bodyParams = bs.getList(2)
+            String type = bs.getString(0);
+            String subType = bs.getString(1);
+            String mimeType = (type + "/" + subType).toLowerCase(Locale.US);
+
+            ImapList bodyParams = null;
+            if (bs.get(2) instanceof ImapList) {
+                bodyParams = bs.getList(2);
             }
-            val encoding = bs.getString(5)
-            val size = bs.getNumber(6)
+            String encoding = bs.getString(5);
+            int size = bs.getNumber(6);
 
             if (MimeUtility.isMessage(mimeType)) {
 //                  A body type of type MESSAGE and subtype RFC822
@@ -903,119 +1003,129 @@ class ImapFolder internal constructor(
                 /*
                  * This will be caught by fetch and handled appropriately.
                  */
-                throw MessagingException("BODYSTRUCTURE message/rfc822 not yet supported.")
+                throw new MessagingException("BODYSTRUCTURE message/rfc822 not yet supported.");
             }
 
-            // Set the content type with as much information as we know right now.
-            val contentType = StringBuilder()
-            contentType.append(mimeType)
+            /*
+             * Set the content type with as much information as we know right now.
+             */
+            StringBuilder contentType = new StringBuilder();
+            contentType.append(mimeType);
 
             if (bodyParams != null) {
-                // If there are body params we might be able to get some more information out of them.
-                for (i in bodyParams.indices step 2) {
-                    val paramName = bodyParams.getString(i)
-                    val paramValue = bodyParams.getString(i + 1)
-                    contentType.append(String.format(";\r\n %s=\"%s\"", paramName, paramValue))
+                /*
+                 * If there are body params we might be able to get some more information out
+                 * of them.
+                 */
+                for (int i = 0, count = bodyParams.size(); i < count; i += 2) {
+                    String paramName = bodyParams.getString(i);
+                    String paramValue = bodyParams.getString(i + 1);
+                    contentType.append(String.format(";\r\n %s=\"%s\"", paramName, paramValue));
                 }
             }
 
-            part.setHeader(MimeHeader.HEADER_CONTENT_TYPE, contentType.toString())
+            part.setHeader(MimeHeader.HEADER_CONTENT_TYPE, contentType.toString());
 
             // Extension items
-            var bodyDisposition: ImapList? = null
-            if ("text".equals(type, ignoreCase = true) && bs.size > 9 && bs[9] is ImapList) {
-                bodyDisposition = bs.getList(9)
-            } else if (!"text".equals(type, ignoreCase = true) && bs.size > 8 && bs[8] is ImapList) {
-                bodyDisposition = bs.getList(8)
+            ImapList bodyDisposition = null;
+            if ("text".equalsIgnoreCase(type) && bs.size() > 9 && bs.get(9) instanceof ImapList) {
+                bodyDisposition = bs.getList(9);
+            } else if (!("text".equalsIgnoreCase(type)) && bs.size() > 8 && bs.get(8) instanceof ImapList) {
+                bodyDisposition = bs.getList(8);
             }
 
-            val contentDisposition = StringBuilder()
+            StringBuilder contentDisposition = new StringBuilder();
+
             if (bodyDisposition != null && !bodyDisposition.isEmpty()) {
-                if (!"NIL".equals(bodyDisposition.getString(0), ignoreCase = true)) {
-                    contentDisposition.append(bodyDisposition.getString(0).toLowerCase(Locale.US))
+                if (!"NIL".equalsIgnoreCase(bodyDisposition.getString(0))) {
+                    contentDisposition.append(bodyDisposition.getString(0).toLowerCase(Locale.US));
                 }
-                if (bodyDisposition.size > 1 && bodyDisposition[1] is ImapList) {
-                    val bodyDispositionParams = bodyDisposition.getList(1)
-                    // If there is body disposition information we can pull some more information
-                    // about the attachment out.
-                    for (i in bodyDispositionParams.indices step 2) {
-                        val paramName = bodyDispositionParams.getString(i).toLowerCase(Locale.US)
-                        val paramValue = bodyDispositionParams.getString(i + 1)
-                        contentDisposition.append(String.format(";\r\n %s=\"%s\"", paramName, paramValue))
+
+                if (bodyDisposition.size() > 1 && bodyDisposition.get(1) instanceof ImapList) {
+                    ImapList bodyDispositionParams = bodyDisposition.getList(1);
+                    /*
+                     * If there is body disposition information we can pull some more information
+                     * about the attachment out.
+                     */
+                    for (int i = 0, count = bodyDispositionParams.size(); i < count; i += 2) {
+                        String paramName = bodyDispositionParams.getString(i).toLowerCase(Locale.US);
+                        String paramValue = bodyDispositionParams.getString(i + 1);
+                        contentDisposition.append(String.format(";\r\n %s=\"%s\"", paramName, paramValue));
                     }
                 }
             }
 
             if (MimeUtility.getHeaderParameter(contentDisposition.toString(), "size") == null) {
-                contentDisposition.append(String.format(Locale.US, ";\r\n size=%d", size))
+                contentDisposition.append(String.format(Locale.US, ";\r\n size=%d", size));
             }
 
-            // Set the content disposition containing at least the size. Attachment  handling code will use this
-            // down the road.
-            part.setHeader(MimeHeader.HEADER_CONTENT_DISPOSITION, contentDisposition.toString())
+            /*
+             * Set the content disposition containing at least the size. Attachment
+             * handling code will use this down the road.
+             */
+            part.setHeader(MimeHeader.HEADER_CONTENT_DISPOSITION, contentDisposition.toString());
 
-            // Set the Content-Transfer-Encoding header. Attachment code will use this to parse the body.
-            part.setHeader(MimeHeader.HEADER_CONTENT_TRANSFER_ENCODING, encoding)
+            /*
+             * Set the Content-Transfer-Encoding header. Attachment code will use this
+             * to parse the body.
+             */
+            part.setHeader(MimeHeader.HEADER_CONTENT_TRANSFER_ENCODING, encoding);
 
-            if (part is ImapMessage) {
-                part.setSize(size)
+            if (part instanceof ImapMessage) {
+                ((ImapMessage) part).setSize(size);
             }
 
-            part.serverExtra = id
+            part.setServerExtra(id);
         }
     }
 
     /**
      * Appends the given messages to the selected folder.
      *
+     * <p>
      * This implementation also determines the new UIDs of the given messages on the IMAP
      * server and changes the messages' UIDs to the new server UIDs.
+     * </p>
      *
      * @param messages
-     * The messages to append to the folder.
+     *         The messages to append to the folder.
      *
      * @return The mapping of original message UIDs to the new server UIDs.
      */
-    @Throws(MessagingException::class)
-    fun appendMessages(messages: List<Message>): Map<String, String>? {
-        open(OPEN_MODE_RW)
-        checkOpen()
+    @Override
+    public Map<String, String> appendMessages(List<? extends Message> messages) throws MessagingException {
+        open(OPEN_MODE_RW);
+        checkOpen();
 
-        return try {
-            val uidMap: MutableMap<String, String> = HashMap()
-            for (message in messages) {
-                val messageSize = message.calculateSize()
+        try {
+            Map<String, String> uidMap = new HashMap<>();
+            for (Message message : messages) {
+                long messageSize = message.calculateSize();
 
-                val encodeFolderName = folderNameCodec.encode(prefixedName)
-                val escapedFolderName = ImapUtility.encodeString(encodeFolderName)
-                val combinedFlags = ImapUtility.combineFlags(
-                    message.flags,
-                    canCreateKeywords || store.permanentFlagsIndex.contains(Flag.FORWARDED)
-                )
-                val command = String.format(
-                    Locale.US, "APPEND %s (%s) {%d}",
-                    escapedFolderName, combinedFlags, messageSize
-                )
-                connection!!.sendCommand(command, false)
+                String encodeFolderName = folderNameCodec.encode(getPrefixedName());
+                String escapedFolderName = ImapUtility.encodeString(encodeFolderName);
+                String combinedFlags = ImapUtility.combineFlags(message.getFlags(),
+                        canCreateKeywords || store.getPermanentFlagsIndex().contains(Flag.FORWARDED));
+                String command = String.format(Locale.US, "APPEND %s (%s) {%d}", escapedFolderName,
+                        combinedFlags, messageSize);
+                connection.sendCommand(command, false);
 
-                var response: ImapResponse
+                ImapResponse response;
                 do {
-                    response = connection!!.readResponse()
+                    response = connection.readResponse();
 
-                    handleUntaggedResponse(response)
+                    handleUntaggedResponse(response);
 
-                    if (response.isContinuationRequested) {
-                        val eolOut = EOLConvertingOutputStream(connection!!.outputStream)
-                        message.writeTo(eolOut)
-                        eolOut.write('\r'.toInt())
-                        eolOut.write('\n'.toInt())
-                        eolOut.flush()
+                    if (response.isContinuationRequested()) {
+                        EOLConvertingOutputStream eolOut = new EOLConvertingOutputStream(connection.getOutputStream());
+                        message.writeTo(eolOut);
+                        eolOut.write('\r');
+                        eolOut.write('\n');
+                        eolOut.flush();
                     }
-                } while (response.tag == null)
+                } while (response.getTag() == null);
 
-                if (response.size < 1 || !ImapResponseParser.equalsIgnoreCase(response[0], Responses.OK)) {
-                    throw NegativeImapResponseException("APPEND failed", listOf(response))
-                } else if (response.size > 1) {
+                if (response.size() > 1) {
                     /*
                      * If the server supports UIDPLUS, then along with the APPEND response it
                      * will return an APPENDUID response code, e.g.
@@ -1024,212 +1134,262 @@ class ImapFolder internal constructor(
                      *
                      * We can use the UID included in this response to update our records.
                      */
-                    val appendList = response[1]
-                    if (appendList is ImapList) {
-                        if (appendList.size >= 3 && appendList.getString(0) == "APPENDUID") {
-                            val newUid = appendList.getString(2)
-                            if (newUid.isNotEmpty()) {
-                                uidMap[message.uid] = newUid
-                                message.uid = newUid
-                                continue
+                    Object responseList = response.get(1);
+
+                    if (responseList instanceof ImapList) {
+                        ImapList appendList = (ImapList) responseList;
+                        if (appendList.size() >= 3 && appendList.getString(0).equals("APPENDUID")) {
+                            String newUid = appendList.getString(2);
+
+                            if (!TextUtils.isEmpty(newUid)) {
+                                uidMap.put(message.getUid(), newUid);
+                                message.setUid(newUid);
+                                continue;
                             }
                         }
                     }
                 }
 
-                // This part is executed in case the server does not support UIDPLUS or does not implement the
-                // APPENDUID response code.
-                val messageId = extractMessageId(message)
-                val newUid = messageId?.let { getUidFromMessageId(it) }
+                /*
+                 * This part is executed in case the server does not support UIDPLUS or does
+                 * not implement the APPENDUID response code.
+                 */
+                String messageId = extractMessageId(message);
+                String newUid = messageId != null ? getUidFromMessageId(messageId) : null;
                 if (K9MailLib.isDebug()) {
-                    Timber.d("Got UID %s for message for %s", newUid, logId)
+                    Timber.d("Got UID %s for message for %s", newUid, getLogId());
                 }
 
-                newUid?.let {
-                    uidMap[message.uid] = newUid
-                    message.uid = newUid
+                if (!TextUtils.isEmpty(newUid)) {
+                    uidMap.put(message.getUid(), newUid);
+                    message.setUid(newUid);
                 }
             }
 
-            // We need uidMap to be null if new UIDs are not available to maintain consistency with the behavior of
-            // other similar methods (copyMessages, moveMessages) which return null.
-            if (uidMap.isEmpty()) null else uidMap
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            /*
+             * We need uidMap to be null if new UIDs are not available to maintain consistency
+             * with the behavior of other similar methods (copyMessages, moveMessages) which
+             * return null.
+             */
+            return (uidMap.isEmpty()) ? null : uidMap;
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    private fun extractMessageId(message: Message): String? {
-        return message.getHeader("Message-ID").firstOrNull()
+    private String extractMessageId(Message message) {
+        String[] messageIdHeader = message.getHeader("Message-ID");
+        return messageIdHeader.length == 0 ? null : messageIdHeader[0];
     }
 
-    @Throws(MessagingException::class)
-    fun getUidFromMessageId(messageId: String?): String? {
+    @Override
+    public String getUidFromMessageId(String messageId) throws MessagingException {
         if (K9MailLib.isDebug()) {
-            Timber.d("Looking for UID for message with message-id %s for %s", messageId, logId)
+            Timber.d("Looking for UID for message with message-id %s for %s", messageId, getLogId());
         }
 
-        val command = String.format("UID SEARCH HEADER MESSAGE-ID %s", ImapUtility.encodeString(messageId))
-        val imapResponses = try {
-            executeSimpleCommand(command)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+        String command = String.format("UID SEARCH HEADER MESSAGE-ID %s", ImapUtility.encodeString(messageId));
+
+        List<ImapResponse> imapResponses;
+        try {
+            imapResponses = executeSimpleCommand(command);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
 
-        val searchResponse = SearchResponse.parse(imapResponses)
-        return searchResponse.numbers.firstOrNull()?.toString()
+        SearchResponse searchResponse = SearchResponse.parse(imapResponses);
+        List<Long> uids = searchResponse.getNumbers();
+        if (uids.size() > 0) {
+            return Long.toString(uids.get(0));
+        }
+
+        return null;
     }
 
-    @Throws(MessagingException::class)
-    fun expunge() {
-        open(OPEN_MODE_RW)
-        checkOpen()
+    @Override
+    public void expunge() throws MessagingException {
+        open(OPEN_MODE_RW);
+        checkOpen();
 
         try {
-            executeSimpleCommand("EXPUNGE")
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            executeSimpleCommand("EXPUNGE");
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    @Throws(MessagingException::class)
-    fun expungeUids(uids: List<String>) {
-        require(uids.isNotEmpty()) { "expungeUids() must be called with a non-empty set of UIDs" }
+    @Override
+    public void expungeUids(List<String> uids) throws MessagingException {
+        if (uids == null || uids.isEmpty()) {
+            throw new IllegalArgumentException("expungeUids() must be called with a non-empty set of UIDs");
+        }
 
-        open(OPEN_MODE_RW)
-        checkOpen()
+        open(OPEN_MODE_RW);
+        checkOpen();
 
         try {
-            if (connection!!.isUidPlusCapable) {
-                val longUids = uids.map { it.toLong() }.toSet()
-                connection!!.executeCommandWithIdSet(Commands.UID_EXPUNGE, "", longUids)
+            if (connection.isUidPlusCapable()) {
+                Set<Long> longUids = new HashSet<>(uids.size());
+                for (String uid : uids) {
+                    longUids.add(Long.parseLong(uid));
+                }
+                connection.executeCommandWithIdSet(Commands.UID_EXPUNGE, "", longUids);
             } else {
-                executeSimpleCommand("EXPUNGE")
+                executeSimpleCommand("EXPUNGE");
             }
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    @Throws(MessagingException::class)
-    fun setFlags(flags: Set<Flag?>?, value: Boolean) {
-        open(OPEN_MODE_RW)
-        checkOpen()
+    @Override
+    public void setFlags(Set<Flag> flags, boolean value) throws MessagingException {
+        open(OPEN_MODE_RW);
+        checkOpen();
 
-        val canCreateForwardedFlag = canCreateKeywords || store.permanentFlagsIndex.contains(Flag.FORWARDED)
+        boolean canCreateForwardedFlag = canCreateKeywords ||
+                store.getPermanentFlagsIndex().contains(Flag.FORWARDED);
+
         try {
-            val combinedFlags = ImapUtility.combineFlags(flags, canCreateForwardedFlag)
-            val command = String.format(
-                "%s 1:* %sFLAGS.SILENT (%s)",
-                Commands.UID_STORE,
-                if (value) "+" else "-",
-                combinedFlags
-            )
-
-            executeSimpleCommand(command)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
+            String combinedFlags = ImapUtility.combineFlags(flags, canCreateForwardedFlag);
+            String command = String.format("%s 1:* %sFLAGS.SILENT (%s)",
+                    Commands.UID_STORE, value ? "+" : "-", combinedFlags);
+            executeSimpleCommand(command);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
         }
     }
 
-    @Throws(MessagingException::class)
-    fun setFlags(messages: List<ImapMessage>, flags: Set<Flag?>?, value: Boolean) {
-        open(OPEN_MODE_RW)
-        checkOpen()
-
-        val uids = messages.map { it.uid.toLong() }.toSet()
-        val canCreateForwardedFlag = canCreateKeywords || store.permanentFlagsIndex.contains(Flag.FORWARDED)
-        val combinedFlags = ImapUtility.combineFlags(flags, canCreateForwardedFlag)
-        val commandSuffix = String.format("%sFLAGS.SILENT (%s)", if (value) "+" else "-", combinedFlags)
+    @Override
+    public String getNewPushState(String oldSerializedPushState, Message message) {
         try {
-            connection!!.executeCommandWithIdSet(Commands.UID_STORE, commandSuffix, uids)
-        } catch (ioe: IOException) {
-            throw ioExceptionHandler(connection, ioe)
-        }
-    }
+            String uid = message.getUid();
+            long messageUid = Long.parseLong(uid);
 
-    @Throws(MessagingException::class)
-    private fun checkOpen() {
-        if (!isOpen) {
-            throw MessagingException("Folder $prefixedName is not open.")
-        }
-    }
+            ImapPushState oldPushState = ImapPushState.parse(oldSerializedPushState);
 
-    private fun ioExceptionHandler(connection: ImapConnection?, ioe: IOException): MessagingException {
-        Timber.e(ioe, "IOException for %s", logId)
-        connection?.close()
-        close()
-        return MessagingException("IO Error", ioe)
-    }
+            if (messageUid >= oldPushState.uidNext) {
+                long uidNext = messageUid + 1;
+                ImapPushState newPushState = new ImapPushState(uidNext);
 
-    override fun equals(other: Any?): Boolean {
-        if (other is ImapFolder) {
-            return other.serverId == serverId
-        }
-        return super.equals(other)
-    }
-
-    override fun hashCode(): Int {
-        return serverId.hashCode()
-    }
-
-    private val logId: String
-        get() {
-            var id = store.logLabel + ":" + serverId + "/" + Thread.currentThread().name
-            if (connection != null) {
-                id += "/" + connection!!.logId
+                return newPushState.toString();
+            } else {
+                return null;
             }
-            return id
+        } catch (Exception e) {
+            Timber.e(e, "Exception while updated push state for %s", getLogId());
+            return null;
         }
+    }
+
+    @Override
+    public void setFlags(List<? extends Message> messages, final Set<Flag> flags, boolean value)
+            throws MessagingException {
+        open(OPEN_MODE_RW);
+        checkOpen();
+
+        Set<Long> uids = new HashSet<>(messages.size());
+        for (Message message : messages) {
+            uids.add(Long.parseLong(message.getUid()));
+        }
+
+        boolean canCreateForwardedFlag = canCreateKeywords ||
+                store.getPermanentFlagsIndex().contains(Flag.FORWARDED);
+
+        String combinedFlags = ImapUtility.combineFlags(flags, canCreateForwardedFlag);
+        String commandSuffix = String.format("%sFLAGS.SILENT (%s)", value ? "+" : "-", combinedFlags);
+
+        try {
+            connection.executeCommandWithIdSet(Commands.UID_STORE, commandSuffix, uids);
+        } catch (IOException ioe) {
+            throw ioExceptionHandler(connection, ioe);
+        }
+    }
+
+    private void checkOpen() throws MessagingException {
+        if (!isOpen()) {
+            throw new MessagingException("Folder " + getPrefixedName() + " is not open.");
+        }
+    }
+
+    private MessagingException ioExceptionHandler(ImapConnection connection, IOException ioe) {
+        Timber.e(ioe, "IOException for %s", getLogId());
+
+        if (connection != null) {
+            connection.close();
+        }
+
+        close();
+
+        return new MessagingException("IO Error", ioe);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (other instanceof ImapFolder) {
+            ImapFolder otherFolder = (ImapFolder) other;
+            return otherFolder.getServerId().equals(getServerId());
+        }
+
+        return super.equals(other);
+    }
+
+    @Override
+    public int hashCode() {
+        return getServerId().hashCode();
+    }
+
+    private ImapStore getStore() {
+        return store;
+    }
+
+    protected String getLogId() {
+        String id = store.getStoreConfig().toString() + ":" + getServerId() + "/" + Thread.currentThread().getName();
+        if (connection != null) {
+            id += "/" + connection.getLogId();
+        }
+
+        return id;
+    }
 
     /**
      * Search the remote ImapFolder.
+     * @param queryString String to query for.
+     * @param requiredFlags Mandatory flags
+     * @param forbiddenFlags Flags to exclude
+     * @return List of messages found
+     * @throws MessagingException On any error.
      */
-    @Throws(MessagingException::class)
-    fun search(
-        queryString: String?,
-        requiredFlags: Set<Flag?>?,
-        forbiddenFlags: Set<Flag?>?,
-        performFullTextSearch: Boolean
-    ): List<ImapMessage> {
+    @Override
+    public List<ImapMessage> search(final String queryString, final Set<Flag> requiredFlags,
+            final Set<Flag> forbiddenFlags) throws MessagingException {
+
+        if (!store.getStoreConfig().isAllowRemoteSearch()) {
+            throw new MessagingException("Your settings do not allow remote searching of this account");
+        }
+
         try {
-            open(OPEN_MODE_RO)
-            checkOpen()
+            open(OPEN_MODE_RO);
+            checkOpen();
 
-            inSearch = true
+            inSearch = true;
 
-            val searchCommand = UidSearchCommandBuilder()
-                .queryString(queryString)
-                .performFullTextSearch(performFullTextSearch)
-                .requiredFlags(requiredFlags)
-                .forbiddenFlags(forbiddenFlags)
-                .build()
+            String searchCommand = new UidSearchCommandBuilder()
+                    .queryString(queryString)
+                    .performFullTextSearch(store.getStoreConfig().isRemoteSearchFullText())
+                    .requiredFlags(requiredFlags)
+                    .forbiddenFlags(forbiddenFlags)
+                    .build();
 
             try {
-                val imapResponses = executeSimpleCommand(searchCommand)
-                val searchResponse = SearchResponse.parse(imapResponses)
-
-                return getMessages(searchResponse, null)
-            } catch (ioe: IOException) {
-                throw ioExceptionHandler(connection, ioe)
+                List<ImapResponse> imapResponses = executeSimpleCommand(searchCommand);
+                SearchResponse searchResponse = SearchResponse.parse(imapResponses);
+                return getMessages(searchResponse, null);
+            } catch (IOException ioe) {
+                throw ioExceptionHandler(connection, ioe);
             }
         } finally {
-            inSearch = false
-        }
-    }
-
-    companion object {
-        private const val MORE_MESSAGES_WINDOW_SIZE = 500
-        private const val FETCH_WINDOW_SIZE = 100
-
-        const val OPEN_MODE_RW = 0
-        const val OPEN_MODE_RO = 1
-        const val INBOX = "INBOX"
-
-        private val RFC3501_DATE: ThreadLocal<SimpleDateFormat> = object : ThreadLocal<SimpleDateFormat>() {
-            override fun initialValue(): SimpleDateFormat {
-                return SimpleDateFormat("dd-MMM-yyyy", Locale.US)
-            }
+            inSearch = false;
         }
     }
 }

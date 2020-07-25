@@ -6,6 +6,8 @@ import com.fsck.k9.mail.Flag
 import com.fsck.k9.mail.Message
 import com.fsck.k9.mail.MessagingException
 import com.fsck.k9.mail.Part
+import com.fsck.k9.mail.PushReceiver
+import com.fsck.k9.mail.Pusher
 
 interface Backend {
     val supportsFlags: Boolean
@@ -91,6 +93,8 @@ interface Backend {
 
     @Throws(MessagingException::class)
     fun uploadMessage(folderServerId: String, message: Message): String?
+    
+    fun createPusher(receiver: PushReceiver): Pusher
 
     @Throws(MessagingException::class)
     fun checkIncomingServerSettings()

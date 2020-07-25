@@ -9,12 +9,29 @@ import android.content.Context;
 import com.fsck.k9.Account;
 import com.fsck.k9.mail.Message;
 import com.fsck.k9.mail.Part;
+import com.fsck.k9.mailstore.LocalFolder;
 import com.fsck.k9.mailstore.LocalMessage;
 
 
 public abstract class SimpleMessagingListener implements MessagingListener {
     @Override
     public void accountSizeChanged(Account account, long oldSize, long newSize) {
+    }
+
+    @Override
+    public void listFoldersStarted(Account account) {
+    }
+
+    @Override
+    public void listFolders(Account account, List<LocalFolder> folders) {
+    }
+
+    @Override
+    public void listFoldersFinished(Account account) {
+    }
+
+    @Override
+    public void listFoldersFailed(Account account, String message) {
     }
 
     @Override
@@ -26,11 +43,11 @@ public abstract class SimpleMessagingListener implements MessagingListener {
     }
 
     @Override
-    public void synchronizeMailboxStarted(Account account, long folderId) {
+    public void synchronizeMailboxStarted(Account account, String folderServerId, String folderName) {
     }
 
     @Override
-    public void synchronizeMailboxHeadersStarted(Account account, String folderServerId) {
+    public void synchronizeMailboxHeadersStarted(Account account, String folderServerId, String folderName) {
     }
 
     @Override
@@ -43,7 +60,7 @@ public abstract class SimpleMessagingListener implements MessagingListener {
     }
 
     @Override
-    public void synchronizeMailboxProgress(Account account, long folderId, int completed, int total) {
+    public void synchronizeMailboxProgress(Account account, String folderServerId, int completed, int total) {
     }
 
     @Override
@@ -55,19 +72,20 @@ public abstract class SimpleMessagingListener implements MessagingListener {
     }
 
     @Override
-    public void synchronizeMailboxFinished(Account account, long folderId) {
+    public void synchronizeMailboxFinished(Account account, String folderServerId, int totalMessagesInMailbox,
+            int numNewMessages) {
     }
 
     @Override
-    public void synchronizeMailboxFailed(Account account, long folderId, String message) {
+    public void synchronizeMailboxFailed(Account account, String folderServerId, String message) {
     }
 
     @Override
-    public void loadMessageRemoteFinished(Account account, long folderId, String uid) {
+    public void loadMessageRemoteFinished(Account account, String folderServerId, String uid) {
     }
 
     @Override
-    public void loadMessageRemoteFailed(Account account, long folderId, String uid, Throwable t) {
+    public void loadMessageRemoteFailed(Account account, String folderServerId, String uid, Throwable t) {
     }
 
     @Override
@@ -79,11 +97,39 @@ public abstract class SimpleMessagingListener implements MessagingListener {
     }
 
     @Override
-    public void folderStatusChanged(Account account, long folderId) {
+    public void sendPendingMessagesStarted(Account account) {
     }
 
     @Override
-    public void messageUidChanged(Account account, long folderId, String oldUid, String newUid) {
+    public void sendPendingMessagesCompleted(Account account) {
+    }
+
+    @Override
+    public void sendPendingMessagesFailed(Account account) {
+    }
+
+    @Override
+    public void emptyTrashCompleted(Account account) {
+    }
+
+    @Override
+    public void folderStatusChanged(Account account, String folderServerId, int unreadMessageCount) {
+    }
+
+    @Override
+    public void systemStatusChanged() {
+    }
+
+    @Override
+    public void messageDeleted(Account account, String folderServerId, String messageServerId) {
+    }
+
+    @Override
+    public void messageUidChanged(Account account, String folderServerId, String oldUid, String newUid) {
+    }
+
+    @Override
+    public void setPushActive(Account account, String folderServerId, boolean enabled) {
     }
 
     @Override
@@ -95,15 +141,31 @@ public abstract class SimpleMessagingListener implements MessagingListener {
     }
 
     @Override
-    public void remoteSearchStarted(long folderId) {
+    public void pendingCommandStarted(Account account, String commandTitle) {
     }
 
     @Override
-    public void remoteSearchServerQueryComplete(long folderId, int numResults, int maxResults) {
+    public void pendingCommandsProcessing(Account account) {
     }
 
     @Override
-    public void remoteSearchFinished(long folderId, int numResults, int maxResults, List<String> extraResults) {
+    public void pendingCommandCompleted(Account account, String commandTitle) {
+    }
+
+    @Override
+    public void pendingCommandsFinished(Account account) {
+    }
+
+    @Override
+    public void remoteSearchStarted(String folder) {
+    }
+
+    @Override
+    public void remoteSearchServerQueryComplete(String folderServerId, int numResults, int maxResults) {
+    }
+
+    @Override
+    public void remoteSearchFinished(String folderServerId, int numResults, int maxResults, List<String> extraResults) {
     }
 
     @Override

@@ -259,6 +259,14 @@
         <service
             android:name="com.fsck.k9.notification.NotificationActionService"
             android:enabled="true"/>
+            
+         <service
+            android:name="com.fsck.k9.service.PushService"
+            android:enabled="true"/>
+
+        <service
+            android:name="com.fsck.k9.service.SleepService"
+            android:enabled="true"/>
 
         <service
             android:name="com.fsck.k9.service.DatabaseUpgradeService"
